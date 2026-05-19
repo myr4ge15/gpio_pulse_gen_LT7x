@@ -17,13 +17,14 @@ GPIO Pulse Generator — TELEOFIS LT70
   GND роутера         → I{x}- УСПД
 
 Использование:
-  python3 gpio_pulse_gen.py [--freq FREQ] [--duty DUTY] [--io1 N] [--io2 N]
+  python3 gpio_pulse_gen.py [--freq FREQ] [--duty DUTY] [--outputs 1,2,...]
 
 Примеры:
-  python3 gpio_pulse_gen.py --dry-run           # симуляция без железа
-  python3 gpio_pulse_gen.py --freq 0.5          # 1 имп/2с, IO1 + IO2
-  python3 gpio_pulse_gen.py --freq 1 --io1 1 --io2 3
-  python3 gpio_pulse_gen.py --freq 0.5 --duty 30
+  python3 gpio_pulse_gen.py --dry-run                    # симуляция без железа, IO1
+  python3 gpio_pulse_gen.py --freq 0.5                   # IO1 (по умолчанию)
+  python3 gpio_pulse_gen.py --freq 0.5 --outputs 1,2,3,4
+  python3 gpio_pulse_gen.py --freq 1 --outputs 1,5,7
+  python3 gpio_pulse_gen.py --freq 0.5 --outputs 1,2 --sync
 
 Ограничения УСПД RTU202:
   Частота опроса 2 Гц  (по умолч.) → минимальный импульс 500 мс → max 1 Гц
@@ -214,7 +215,7 @@ def draw(channels: list, dry_run: bool, start_time: float):
     for ch in channels:
         idx  = io_index(ch.io_num)
         out.append(
-            f"  {BOLD}{FG_CYAN}Канал {ch.idx}{RESET}  "
+            f"  {BOLD}{FG_CYAN}Выход {ch.idx}{RESET}  "
             f"IO{ch.io_num}  "
             f"{FG_GRAY}/dev/pd{idx}/direction{RESET}"
         )
@@ -278,12 +279,10 @@ def main():
                         help="Частота Гц (по умолч. 0.5 = 1 имп/2с)")
     parser.add_argument("--duty",    type=float, default=50.0,
                         help="Скважность %% (по умолч. 50)")
-    parser.add_argument("--io1",     type=int,   default=1,
-                        help="IO пин канала 1 (1–9, по умолч. 1)")
-    parser.add_argument("--io2",     type=int,   default=None,
-                        help="IO пин канала 2 (1–9, не указан = только 1 канал)")
+    parser.add_argument("--outputs", type=str,   default="1",
+                        help="IO пины роутера через запятую (1–9, по умолч. 1). Пример: 1,2,3,4")
     parser.add_argument("--sync",    action="store_true",
-                        help="Синхронный старт (без сдвига фазы)")
+                        help="Синхронный старт всех выходов (без сдвига фазы)")
     parser.add_argument("--refresh", type=float, default=0.15,
                         help="Частота обновления экрана сек (по умолч. 0.15)")
     parser.add_argument("--dry-run", action="store_true",
@@ -294,18 +293,24 @@ def main():
         sys.exit("Ошибка: --freq должен быть > 0")
     if not (1 <= args.duty <= 99):
         sys.exit("Ошибка: --duty от 1 до 99")
-    if not (1 <= args.io1 <= 9):
-        sys.exit(f"Ошибка: --io1 должен быть 1–9, получено {args.io1}")
-    if args.io2 is not None:
-        if not (1 <= args.io2 <= 9):
-            sys.exit(f"Ошибка: --io2 должен быть 1–9, получено {args.io2}")
-        if args.io1 == args.io2:
-            sys.exit("Ошибка: --io1 и --io2 должны быть разными")
+
+    # парсим список пинов
+    try:
+        io_pins = [int(x.strip()) for x in args.outputs.split(",")]
+    except ValueError:
+        sys.exit("Ошибка: --outputs должен быть списком чисел через запятую, например: 1,2,3,4")
+
+    if not io_pins:
+        sys.exit("Ошибка: --outputs не может быть пустым")
+    for p in io_pins:
+        if not (1 <= p <= 9):
+            sys.exit(f"Ошибка: пин {p} вне диапазона 1–9")
+    if len(io_pins) != len(set(io_pins)):
+        sys.exit("Ошибка: в --outputs не должно быть повторяющихся пинов")
 
     duty = args.duty / 100.0
     check_freq(args.freq, duty)
 
-    io_pins = [args.io1] + ([args.io2] if args.io2 is not None else [])
     for io_num in io_pins:
         if not check_sysfs(io_num, args.dry_run):
             sys.exit(1)
@@ -313,11 +318,13 @@ def main():
     channels = [Channel(i + 1, pin, args.freq, duty, args.dry_run)
                 for i, pin in enumerate(io_pins)]
 
-    phase = 0.0 if args.sync else channels[0].period / 2.0
+    # равномерный сдвиг фазы между выходами: 0%, 25%, 50%, 75% периода
+    period = channels[0].period
+    n = len(channels)
     start_time = time.time()
-    channels[0].start(phase_delay=0.0)
-    if len(channels) > 1:
-        channels[1].start(phase_delay=phase)
+    for i, ch in enumerate(channels):
+        delay = 0.0 if args.sync else (period / n * i)
+        ch.start(phase_delay=delay)
 
     def shutdown(sig=None, frame=None):
         print("\033[?25h", end="", flush=True)
