@@ -39,7 +39,7 @@ import argparse
 import threading
 from datetime import datetime
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ─── ANSI коды ────────────────────────────────────────────────────────────────
 RESET    = "\033[0m"
@@ -53,9 +53,12 @@ FG_GREEN  = "\033[92m"
 FG_YELLOW = "\033[93m"
 FG_GRAY   = "\033[90m"
 FG_BLACK  = "\033[30m"
+FG_RED    = "\033[91m"
 
 BG_GREEN  = "\033[42m"
 BG_GRAY   = "\033[100m"
+BG_WHITE  = "\033[107m"
+BG_RED    = "\033[101m"
 
 # ─── Sysfs GPIO (iolines LT70) ────────────────────────────────────────────────
 
@@ -108,12 +111,14 @@ def io_reset(io_num: int, dry_run: bool):
 
 # ─── Канал ────────────────────────────────────────────────────────────────────
 class Channel:
-    def __init__(self, idx: int, io_num: int, freq: float, duty: float, dry_run: bool):
+    def __init__(self, idx: int, io_num: int, freq: float, duty: float,
+                 dry_run: bool, lpp: float = 1.0):
         self.idx     = idx
         self.io_num  = io_num
         self.freq    = freq
         self.duty    = duty
         self.dry_run = dry_run
+        self.lpp     = lpp          # литров на импульс
 
         self.count   = 0
         self.state   = False
@@ -133,6 +138,21 @@ class Channel:
     @property
     def t_off(self):
         return self.period * (1.0 - self.duty)
+
+    @property
+    def liters(self) -> float:
+        """Накопленный объём, литры"""
+        return self.count * self.lpp
+
+    @property
+    def m3(self) -> float:
+        """Накопленный объём, кубометры"""
+        return self.liters / 1000.0
+
+    @property
+    def flow_lpm(self) -> float:
+        """Текущий расход, л/мин (freq имп/с × лит/имп × 60)"""
+        return self.freq * self.lpp * 60.0
 
     def _run(self):
         self.running = True
@@ -193,6 +213,22 @@ def bar(state: bool) -> str:
     else:
         return f"{FG_GRAY}░░░░░░{RESET}"
 
+def odometer(ch) -> str:
+    """
+    Табло водосчётчика: 5 чёрных барабанов = м³, 3 красных = литры.
+    1 импульс = ch.lpp литров.  Пример: 51 л → 00000 . 051  м³
+    """
+    total_l = round(ch.liters, 3)
+    m3_int  = int(total_l // 1000)
+    rem_l   = total_l - m3_int * 1000          # 0..999.xxx литры в текущем м³
+    int_str = f"{m3_int:05d}"[-5:]
+    frac_str = f"{int(rem_l):03d}"
+
+    black = "".join(f"{BG_WHITE}{FG_BLACK}{BOLD} {d} {RESET}" for d in int_str)
+    red   = "".join(f"{BG_RED}{FG_WHITE}{BOLD} {d} {RESET}" for d in frac_str)
+    return f"{black}{FG_RED}{BOLD}.{RESET}{red}"
+
+
 def draw(channels: list, dry_run: bool, start_time: float):
     now = time.time()
     elapsed = now - start_time
@@ -227,7 +263,16 @@ def draw(channels: list, dry_run: bool, start_time: float):
         )
         out.append(
             f"  {led(ch.state)}  {bar(ch.state)}  "
-            f"Импульсов: {BOLD}{FG_WHITE}{ch.count:>6}{RESET}"
+            f"Импульсов: {BOLD}{FG_WHITE}{ch.count:>6}{RESET}  "
+            f"{FG_GRAY}({ch.lpp:g} л/имп){RESET}"
+        )
+        out.append(
+            f"  {BOLD}{FG_CYAN}ВОДОСЧЁТЧИК{RESET}  {odometer(ch)} {BOLD}м³{RESET}"
+        )
+        out.append(
+            f"  {FG_GRAY}объём: {RESET}{BOLD}{FG_WHITE}{ch.m3:.3f} м³{RESET}"
+            f"{FG_GRAY}  ({ch.liters:.0f} л)   расход: {RESET}"
+            f"{BOLD}{FG_WHITE}{ch.flow_lpm:.2f} л/мин{RESET}"
         )
         out.append(f"  {FG_GRAY}{'─'*32}{RESET}  {sparkline(ch.history)}")
         out.append("")
@@ -236,9 +281,14 @@ def draw(channels: list, dry_run: bool, start_time: float):
         out.append(f"  {FG_YELLOW}⚠  " + "   ".join(_warnings[-2:]) + RESET)
         out.append("")
 
-    total = sum(c.count for c in channels)
+    total   = sum(c.count for c in channels)
+    total_l = sum(c.liters for c in channels)
     out.append(f"  {FG_GRAY}{'─'*W}{RESET}")
-    out.append(f"  {DIM}Всего импульсов: {total}   Ctrl+C — выход{RESET}")
+    out.append(
+        f"  {DIM}Всего импульсов: {total}   "
+        f"Всего: {total_l/1000.0:.3f} м³ ({total_l:.0f} л)   "
+        f"Ctrl+C — выход{RESET}"
+    )
 
     print("\n".join(out), end="", flush=True)
 
@@ -279,6 +329,9 @@ def main():
                         help="Частота Гц (по умолч. 0.5 = 1 имп/2с)")
     parser.add_argument("--duty",    type=float, default=50.0,
                         help="Скважность %% (по умолч. 50)")
+    parser.add_argument("--liters-per-pulse", type=float, default=1.0,
+                        dest="lpp",
+                        help="Вес импульса счётчика воды, литров (по умолч. 1.0)")
     parser.add_argument("--outputs", type=str,   default="1",
                         help="IO пины роутера через запятую (1–9, по умолч. 1). Пример: 1,2,3,4")
     parser.add_argument("--sync",    action="store_true",
@@ -293,6 +346,8 @@ def main():
         sys.exit("Ошибка: --freq должен быть > 0")
     if not (1 <= args.duty <= 99):
         sys.exit("Ошибка: --duty от 1 до 99")
+    if args.lpp <= 0:
+        sys.exit("Ошибка: --liters-per-pulse должен быть > 0")
 
     # парсим список пинов
     try:
@@ -315,7 +370,7 @@ def main():
         if not check_sysfs(io_num, args.dry_run):
             sys.exit(1)
 
-    channels = [Channel(i + 1, pin, args.freq, duty, args.dry_run)
+    channels = [Channel(i + 1, pin, args.freq, duty, args.dry_run, args.lpp)
                 for i, pin in enumerate(io_pins)]
 
     # равномерный сдвиг фазы между выходами: 0%, 25%, 50%, 75% периода
