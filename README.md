@@ -58,15 +58,10 @@ GND  ──────────────────────  I2−
 ## Установка
 
 ```bash
-# 1. Убедитесь что пакет iolines установлен и инициализирован
-opkg update
-opkg install iolines-lt70
-/etc/init.d/iolines boot
-
-# 2. Скопируйте скрипт на роутер (например, через scp)
+# 1. Скопируйте скрипт на роутер (например, через scp)
 scp gpio_pulse_gen.py root@192.168.1.1:/root/
 
-# 3. Сделайте исполняемым
+# 2. Сделайте исполняемым
 chmod +x /root/gpio_pulse_gen.py
 ```
 
@@ -108,7 +103,7 @@ python3 gpio_pulse_gen.py --dry-run --freq 1
 
 - TELEOFIS LT70 / LT71 с OpenWrt 22.03
 - Python 3.10+ (входит в стандартную прошивку LT70)
-- Пакет `iolines-lt70` (из [teleofis-feed](https://github.com/teleofis/teleofis-feed))
+- Пакет `iolines-lt70`
 - Стандартная библиотека Python — внешних зависимостей нет
 
 ## Совместимость
