@@ -183,7 +183,9 @@ class Channel:
     def start(self, phase_delay: float = 0.0):
         def _delayed():
             if phase_delay > 0:
-                time.sleep(phase_delay)
+                self._stop.wait(timeout=phase_delay)
+            if self._stop.is_set():
+                return
             self._run()
         self._stop.clear()
         self._thread = threading.Thread(target=_delayed, daemon=True)
@@ -301,7 +303,7 @@ def check_freq(freq: float, duty: float):
         time.sleep(3)
     elif t_on_ms < 500:
         print(f"\n{FG_YELLOW}⚠  ON = {t_on_ms:.1f} мс < 500 мс")
-        print(f"   При опросе УСПД 2 Гц (по умолч.) минимум = 500 мс")
+        print("   При опросе УСПД 2 Гц (по умолч.) минимум = 500 мс")
         print(f"   Переключите УСПД на 20 Гц или уменьшите --freq{RESET}\n")
         time.sleep(3)
 
@@ -311,8 +313,8 @@ def check_sysfs(io_num: int, dry_run: bool) -> bool:
     for path in [pu_path(io_num), pd_path(io_num)]:
         if not os.path.exists(path):
             print(f"{FG_YELLOW}⚠  Не найден: {path}")
-            print(f"   Установите пакет и инициализируйте:")
-            print(f"     opkg install iolines-lt70")
+            print("   Установите пакет и инициализируйте:")
+            print("     opkg install iolines-lt70")
             print(f"     /etc/init.d/iolines boot{RESET}")
             return False
     return True
