@@ -241,7 +241,7 @@ def draw(channels: list, dry_run: bool, start_time: float):
 
     out = [CLEAR]
     out.append(f"{BOLD}{FG_CYAN}╔{'═'*W}╗{RESET}")
-    out.append(f"{BOLD}{FG_CYAN}║  GPIO Pulse Generator — TELEOFIS LT70{' '*(W-39)}║{RESET}")
+    out.append(f"{BOLD}{FG_CYAN}║  GPIO Pulse Generator — TELEOFIS LT70{' '*(W-38)}║{RESET}")
     out.append(f"{BOLD}{FG_CYAN}╚{'═'*W}╝{RESET}")
 
     mode = f"{FG_YELLOW}СИМУЛЯЦИЯ{RESET}" if dry_run else f"{FG_GREEN}РЕАЛЬНЫЙ GPIO{RESET}"
@@ -364,24 +364,19 @@ def main():
         sys.exit("Ошибка: в --outputs не должно быть повторяющихся пинов")
 
     duty = args.duty / 100.0
-    check_freq(args.freq, duty)
 
-    for io_num in io_pins:
-        if not check_sysfs(io_num, args.dry_run):
-            sys.exit(1)
-
+    # Каналы создаём заранее — до возможной блокирующей паузы в check_freq,
+    # чтобы обработчики сигналов уже могли корректно их остановить.
     channels = [Channel(i + 1, pin, args.freq, duty, args.dry_run, args.lpp)
                 for i, pin in enumerate(io_pins)]
 
-    # равномерный сдвиг фазы между выходами: 0%, 25%, 50%, 75% периода
-    period = channels[0].period
-    n = len(channels)
-    start_time = time.time()
-    for i, ch in enumerate(channels):
-        delay = 0.0 if args.sync else (period / n * i)
-        ch.start(phase_delay=delay)
+    _shutting_down = threading.Event()
 
     def shutdown(sig=None, frame=None):
+        # Идемпотентно: при Ctrl+C обработчик и finally не должны дублироваться.
+        if _shutting_down.is_set():
+            return
+        _shutting_down.set()
         print("\033[?25h", end="", flush=True)
         print(f"\n{FG_YELLOW}Остановка...{RESET}", flush=True)
         for ch in channels:
@@ -391,6 +386,20 @@ def main():
 
     signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    check_freq(args.freq, duty)
+
+    for io_num in io_pins:
+        if not check_sysfs(io_num, args.dry_run):
+            sys.exit(1)
+
+    # равномерный сдвиг фазы между выходами: при N каналах i-й сдвинут на i/N периода
+    period = channels[0].period
+    n = len(channels)
+    start_time = time.time()
+    for i, ch in enumerate(channels):
+        delay = 0.0 if args.sync else (period / n * i)
+        ch.start(phase_delay=delay)
 
     print("\033[?25l", end="", flush=True)
 
