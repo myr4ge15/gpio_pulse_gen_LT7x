@@ -3,6 +3,11 @@
 GPIO Pulse Generator — TELEOFIS LT70
 Генератор импульсов для УСПД RTU202 (режим сухой контакт)
 
+Полностью интерактивный: просто запустите без аргументов —
+программа спросит все параметры по шагам (Enter = значение по умолчанию).
+
+  python3 gpio_pulse_gen.py
+
 Использует нативный sysfs-интерфейс iolines LT70:
   /dev/pu{N}/direction  — pull-up
   /dev/pd{N}/direction  — pull-down (наш выход OC)
@@ -16,16 +21,6 @@ GPIO Pulse Generator — TELEOFIS LT70
   IOx роутера (mode3) → I{x}+ УСПД
   GND роутера         → I{x}- УСПД
 
-Использование:
-  python3 gpio_pulse_gen.py [--freq FREQ] [--duty DUTY] [--outputs 1,2,...]
-
-Примеры:
-  python3 gpio_pulse_gen.py --dry-run                    # симуляция без железа, IO1
-  python3 gpio_pulse_gen.py --freq 0.5                   # IO1 (по умолчанию)
-  python3 gpio_pulse_gen.py --freq 0.5 --outputs 1,2,3,4
-  python3 gpio_pulse_gen.py --freq 1 --outputs 1,5,7
-  python3 gpio_pulse_gen.py --freq 0.5 --outputs 1,2 --sync
-
 Ограничения УСПД RTU202:
   Частота опроса 2 Гц  (по умолч.) → минимальный импульс 500 мс → max 1 Гц
   Частота опроса 20 Гц             → минимальный импульс  50 мс → max 10 Гц
@@ -35,11 +30,10 @@ import sys
 import os
 import time
 import signal
-import argparse
 import threading
 from datetime import datetime
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ─── ANSI коды ────────────────────────────────────────────────────────────────
 RESET    = "\033[0m"
@@ -112,13 +106,14 @@ def io_reset(io_num: int, dry_run: bool):
 # ─── Канал ────────────────────────────────────────────────────────────────────
 class Channel:
     def __init__(self, idx: int, io_num: int, freq: float, duty: float,
-                 dry_run: bool, lpp: float = 1.0):
-        self.idx     = idx
-        self.io_num  = io_num
-        self.freq    = freq
-        self.duty    = duty
-        self.dry_run = dry_run
-        self.lpp     = lpp          # литров на импульс
+                 dry_run: bool, lpp: float = 1.0, start_liters: float = 0.0):
+        self.idx          = idx
+        self.io_num       = io_num
+        self.freq         = freq
+        self.duty         = duty
+        self.dry_run      = dry_run
+        self.lpp          = lpp            # литров на импульс
+        self.start_liters = start_liters   # начальные показания счётчика, литры
 
         self.count   = 0
         self.state   = False
@@ -141,12 +136,12 @@ class Channel:
 
     @property
     def liters(self) -> float:
-        """Накопленный объём, литры"""
-        return self.count * self.lpp
+        """Показания счётчика, литры (начальные показания + импульсы сессии)"""
+        return self.start_liters + self.count * self.lpp
 
     @property
     def m3(self) -> float:
-        """Накопленный объём, кубометры"""
+        """Показания счётчика, кубометры"""
         return self.liters / 1000.0
 
     @property
@@ -304,7 +299,7 @@ def check_freq(freq: float, duty: float):
     elif t_on_ms < 500:
         print(f"\n{FG_YELLOW}⚠  ON = {t_on_ms:.1f} мс < 500 мс")
         print("   При опросе УСПД 2 Гц (по умолч.) минимум = 500 мс")
-        print(f"   Переключите УСПД на 20 Гц или уменьшите --freq{RESET}\n")
+        print(f"   Переключите УСПД на 20 Гц или уменьшите частоту{RESET}\n")
         time.sleep(3)
 
 def check_sysfs(io_num: int, dry_run: bool) -> bool:
@@ -319,58 +314,118 @@ def check_sysfs(io_num: int, dry_run: bool) -> bool:
             return False
     return True
 
+# ─── Интерактивный ввод ───────────────────────────────────────────────────────
+def _read_line(prompt: str, default_repr: str) -> str:
+    """input() с поддержкой неинтерактивного запуска (EOF → значение по умолчанию)."""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print(default_repr)
+        return ""
+
+def ask_float(label: str, default: float,
+              gt: float = None, lo: float = None, hi: float = None) -> float:
+    while True:
+        raw = _read_line(f"  {FG_CYAN}{label}{RESET} [{default:g}]: ", f"{default:g}")
+        if raw == "":
+            return default
+        raw = raw.replace(",", ".")
+        try:
+            v = float(raw)
+        except ValueError:
+            print(f"{FG_YELLOW}   Введите число, напр. {default:g}{RESET}")
+            continue
+        if gt is not None and v <= gt:
+            print(f"{FG_YELLOW}   Должно быть больше {gt:g}{RESET}")
+            continue
+        if lo is not None and v < lo:
+            print(f"{FG_YELLOW}   Минимум {lo:g}{RESET}")
+            continue
+        if hi is not None and v > hi:
+            print(f"{FG_YELLOW}   Максимум {hi:g}{RESET}")
+            continue
+        return v
+
+def ask_yesno(label: str, default: bool = False) -> bool:
+    opts = "[Д/н]" if default else "[д/Н]"
+    raw = _read_line(f"  {FG_CYAN}{label}{RESET} {opts}: ",
+                     "д" if default else "н").lower()
+    if raw == "":
+        return default
+    return raw[0] in ("y", "д", "1", "t", "+")
+
+def ask_outputs(default: str = "1") -> list:
+    while True:
+        raw = _read_line(
+            f"  {FG_CYAN}Выходы IO (1–9 через запятую){RESET} [{default}]: ", default)
+        if raw == "":
+            raw = default
+        try:
+            pins = [int(x.strip()) for x in raw.split(",") if x.strip() != ""]
+        except ValueError:
+            print(f"{FG_YELLOW}   Список чисел через запятую, напр. 1,2,3{RESET}")
+            continue
+        if not pins:
+            print(f"{FG_YELLOW}   Нужен хотя бы один выход{RESET}")
+            continue
+        if any(not (1 <= p <= 9) for p in pins):
+            print(f"{FG_YELLOW}   Допустимы пины 1–9{RESET}")
+            continue
+        if len(pins) != len(set(pins)):
+            print(f"{FG_YELLOW}   Пины не должны повторяться{RESET}")
+            continue
+        return pins
+
+def configure() -> dict:
+    """Интерактивный мастер настройки. Возвращает словарь параметров."""
+    print(f"{BOLD}{FG_CYAN}╔══════════════════════════════════════════════════════╗{RESET}")
+    print(f"{BOLD}{FG_CYAN}║  GPIO Pulse Generator — TELEOFIS LT70 → УСПД RTU202   ║{RESET}")
+    print(f"{BOLD}{FG_CYAN}╚══════════════════════════════════════════════════════╝{RESET}")
+    print(f"{FG_GRAY}  Настройка по шагам. Enter — значение по умолчанию. Ctrl+C — выход.{RESET}\n")
+
+    dry_run = ask_yesno("Режим симуляции (без записи в GPIO)?", default=False)
+    io_pins = ask_outputs("1")
+    freq    = ask_float("Частота, Гц", 0.5, gt=0)
+    duty    = ask_float("Скважность, %", 50.0, lo=1, hi=99) / 100.0
+    lpp     = ask_float("Литров на импульс", 1.0, gt=0)
+
+    print(f"\n  {FG_GRAY}Начальные показания счётчиков, м³ (Enter — 0):{RESET}")
+    start_liters = [
+        ask_float(f"Выход {i+1} (IO{p}), м³", 0.0, lo=0) * 1000.0
+        for i, p in enumerate(io_pins)
+    ]
+
+    sync = False
+    if len(io_pins) > 1:
+        sync = ask_yesno("Синхронный старт всех выходов (без сдвига фазы)?", default=False)
+
+    print()
+    return {
+        "dry_run": dry_run, "io_pins": io_pins, "freq": freq, "duty": duty,
+        "lpp": lpp, "start_liters": start_liters, "sync": sync, "refresh": 0.15,
+    }
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="GPIO Pulse Generator — TELEOFIS LT70 → УСПД RTU202",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
-    )
-    parser.add_argument("--version", action="version", version=f"gpio_pulse_gen {__version__}")
-    parser.add_argument("--freq",    type=float, default=0.5,
-                        help="Частота Гц (по умолч. 0.5 = 1 имп/2с)")
-    parser.add_argument("--duty",    type=float, default=50.0,
-                        help="Скважность %% (по умолч. 50)")
-    parser.add_argument("--liters-per-pulse", type=float, default=1.0,
-                        dest="lpp",
-                        help="Вес импульса счётчика воды, литров (по умолч. 1.0)")
-    parser.add_argument("--outputs", type=str,   default="1",
-                        help="IO пины роутера через запятую (1–9, по умолч. 1). Пример: 1,2,3,4")
-    parser.add_argument("--sync",    action="store_true",
-                        help="Синхронный старт всех выходов (без сдвига фазы)")
-    parser.add_argument("--refresh", type=float, default=0.15,
-                        help="Частота обновления экрана сек (по умолч. 0.15)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Симуляция без записи в GPIO")
-    args = parser.parse_args()
+    if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
+        print(f"gpio_pulse_gen {__version__}")
+        return
 
-    if args.freq <= 0:
-        sys.exit("Ошибка: --freq должен быть > 0")
-    if not (1 <= args.duty <= 99):
-        sys.exit("Ошибка: --duty от 1 до 99")
-    if args.lpp <= 0:
-        sys.exit("Ошибка: --liters-per-pulse должен быть > 0")
-
-    # парсим список пинов
     try:
-        io_pins = [int(x.strip()) for x in args.outputs.split(",")]
-    except ValueError:
-        sys.exit("Ошибка: --outputs должен быть списком чисел через запятую, например: 1,2,3,4")
+        cfg = configure()
+    except KeyboardInterrupt:
+        print(f"\n{FG_YELLOW}Отменено.{RESET}")
+        return
 
-    if not io_pins:
-        sys.exit("Ошибка: --outputs не может быть пустым")
-    for p in io_pins:
-        if not (1 <= p <= 9):
-            sys.exit(f"Ошибка: пин {p} вне диапазона 1–9")
-    if len(io_pins) != len(set(io_pins)):
-        sys.exit("Ошибка: в --outputs не должно быть повторяющихся пинов")
-
-    duty = args.duty / 100.0
+    io_pins = cfg["io_pins"]
 
     # Каналы создаём заранее — до возможной блокирующей паузы в check_freq,
     # чтобы обработчики сигналов уже могли корректно их остановить.
-    channels = [Channel(i + 1, pin, args.freq, duty, args.dry_run, args.lpp)
-                for i, pin in enumerate(io_pins)]
+    channels = [
+        Channel(i + 1, pin, cfg["freq"], cfg["duty"], cfg["dry_run"],
+                cfg["lpp"], cfg["start_liters"][i])
+        for i, pin in enumerate(io_pins)
+    ]
 
     _shutting_down = threading.Event()
 
@@ -389,10 +444,10 @@ def main():
     signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    check_freq(args.freq, duty)
+    check_freq(cfg["freq"], cfg["duty"])
 
     for io_num in io_pins:
-        if not check_sysfs(io_num, args.dry_run):
+        if not check_sysfs(io_num, cfg["dry_run"]):
             sys.exit(1)
 
     # равномерный сдвиг фазы между выходами: при N каналах i-й сдвинут на i/N периода
@@ -400,15 +455,15 @@ def main():
     n = len(channels)
     start_time = time.time()
     for i, ch in enumerate(channels):
-        delay = 0.0 if args.sync else (period / n * i)
+        delay = 0.0 if cfg["sync"] else (period / n * i)
         ch.start(phase_delay=delay)
 
     print("\033[?25l", end="", flush=True)
 
     try:
         while True:
-            draw(channels, args.dry_run, start_time)
-            time.sleep(args.refresh)
+            draw(channels, cfg["dry_run"], start_time)
+            time.sleep(cfg["refresh"])
     finally:
         print("\033[?25h", end="", flush=True)
         shutdown()
