@@ -30,12 +30,13 @@ GPIO Pulse Generator — TELEOFIS LT70
 
 import sys
 import os
+import json
 import time
 import signal
 import threading
 from datetime import datetime
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # ─── ANSI коды ────────────────────────────────────────────────────────────────
 RESET    = "\033[0m"
@@ -63,6 +64,12 @@ BG_RED    = "\033[101m"
 MIN_LEVEL_FAST = 0.050   # мин. длительность уровня при опросе УСПД 20 Гц, с
 MIN_LEVEL_SLOW = 0.500   # мин. длительность уровня при опросе УСПД 2 Гц, с
 FINISH_MAX     = 2.0     # при остановке дожидаемся конца импульса, если осталось ≤ стольких секунд
+
+# ─── Сохранение показаний ─────────────────────────────────────────────────────
+# Рядом со скриптом (/root на флеше роутера) — переживает перезагрузку.
+STATE_FILE          = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "gpio_pulse_gen_state.json")
+STATE_SAVE_INTERVAL = 300   # с; плюс сохранение при остановке. Чаще не надо — износ флеша
 
 # ─── Sysfs GPIO (iolines LT70) ────────────────────────────────────────────────
 
@@ -428,6 +435,43 @@ def check_freq(freq: float, duty: float):
         print(f"   Переключите УСПД на 20 Гц, уменьшите частоту или выровняйте скважность{RESET}\n")
         time.sleep(3)
 
+def load_state() -> dict:
+    """Сохранённые показания: {номер IO: литры}. Нет файла или он битый — пусто."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return {int(io): float(v["liters"]) for io, v in data["counters"].items()}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        print(f"{FG_YELLOW}⚠  Не удалось прочитать {STATE_FILE}: {e} — начинаем с нуля{RESET}")
+        return {}
+
+def save_state(channels: list, saved: dict) -> str:
+    """
+    Записывает показания каналов (выходы, не участвующие в сессии, сохраняются как были).
+    Пишем во временный файл и подменяем — при пропадании питания файл не побьётся.
+    Возвращает текст ошибки или None.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            counters = dict(json.load(f)["counters"])
+    except (OSError, ValueError, TypeError, KeyError):
+        counters = {str(io): {"liters": liters} for io, liters in sorted(saved.items())}
+    for ch in channels:
+        counters[str(ch.io_num)] = {"liters": round(ch.liters, 3), "updated": now}
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"updated": now, "counters": counters}, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+        return None
+    except OSError as e:
+        return str(e)
+
 def gpio_hint() -> list:
     return [
         f"{FG_YELLOW}   Проверьте, что скрипт запущен от root и iolines инициализирован:",
@@ -447,7 +491,7 @@ def _read_line(prompt: str, default_repr: str) -> str:
 def ask_float(label: str, default: float,
               gt: float = None, lo: float = None, hi: float = None) -> float:
     while True:
-        raw = _read_line(f"  {FG_CYAN}{label}{RESET} [{default:g}]: ", f"{default:g}")
+        raw = _read_line(f"  {FG_CYAN}{label}{RESET} [{fmt_l(default)}]: ", fmt_l(default))
         if raw == "":
             return default
         raw = raw.replace(",", ".")
@@ -507,17 +551,28 @@ def configure() -> dict:
     print("\n".join(box("GPIO Pulse Generator — TELEOFIS LT70 → УСПД RTU202", 56)))
     print(f"{FG_GRAY}  Настройка по шагам. Enter — значение по умолчанию. Ctrl+C — выход.{RESET}\n")
 
-    dry_run = ask_yesno("Режим симуляции (без записи в GPIO)?", default=False)
+    # не роутер (например, ПК) — реальный режим невозможен, включаем симуляцию без вопроса
+    if os.path.exists(pd_path(1)):
+        dry_run = ask_yesno("Режим симуляции (без записи в GPIO)?", default=False)
+    else:
+        dry_run = True
+        print(f"  {FG_YELLOW}GPIO iolines не найдены ({pd_path(1)}) — режим симуляции.{RESET}")
     io_pins = ask_outputs("1")
     freq    = ask_float("Частота, Гц", 0.5, gt=0)
     duty    = ask_float("Скважность, %", 50.0, lo=1, hi=99) / 100.0
     lpp     = ask_float("Литров на импульс", 1.0, gt=0)
 
-    print(f"\n  {FG_GRAY}Начальные показания счётчиков, м³ (Enter — 0):{RESET}")
+    saved = load_state()
+    if any(p in saved for p in io_pins):
+        print(f"\n  {FG_GRAY}Начальные показания, м³ (Enter — продолжить с сохранённых, 0 — сброс):{RESET}")
+    else:
+        print(f"\n  {FG_GRAY}Начальные показания счётчиков, м³ (Enter — 0):{RESET}")
     start_liters = [
-        ask_float(f"Выход {i+1} (IO{p}), м³", 0.0, lo=0) * 1000.0
+        round(ask_float(f"Выход {i+1} (IO{p}), м³", saved.get(p, 0.0) / 1000.0, lo=0) * 1000.0, 3)
         for i, p in enumerate(io_pins)
     ]
+    if dry_run:
+        print(f"  {FG_GRAY}В симуляции показания не сохраняются.{RESET}")
 
     sync = False
     if len(io_pins) > 1:
@@ -527,6 +582,7 @@ def configure() -> dict:
     return {
         "dry_run": dry_run, "io_pins": io_pins, "freq": freq, "duty": duty,
         "lpp": lpp, "start_liters": start_liters, "sync": sync, "refresh": 0.15,
+        "saved": saved,
     }
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -543,7 +599,22 @@ def _safe_print(*lines):
     except (OSError, ValueError):
         pass
 
+def _enable_windows_ansi():
+    """Консоль Windows (PowerShell 5.1, cmd) по умолчанию не понимает ANSI — включаем VT-режим."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)          # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except (OSError, AttributeError):
+        pass
+
 def main():
+    _enable_windows_ansi()
     if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
         print(f"gpio_pulse_gen {__version__}")
         return
@@ -593,9 +664,13 @@ def main():
             delay = 0.0 if cfg["sync"] else (period / n * i)
             ch.start(phase_delay=delay)
 
+        last_save = time.monotonic()
         while not any(ch.error for ch in channels):
             draw(channels, cfg["dry_run"], start_time)
             time.sleep(cfg["refresh"])
+            if not cfg["dry_run"] and time.monotonic() - last_save >= STATE_SAVE_INTERVAL:
+                save_state(channels, cfg["saved"])
+                last_save = time.monotonic()
         exit_code = 1
     except _Interrupted:
         pass
@@ -613,9 +688,14 @@ def main():
         for ch in channels:
             ch.stop()
         if started:
+            lines = summary(channels)
+            if not cfg["dry_run"]:
+                err = save_state(channels, cfg["saved"])
+                lines.append(f"  {FG_GRAY}Показания сохранены: {STATE_FILE}{RESET}" if err is None
+                             else f"{FG_RED}  Не удалось сохранить показания: {err}{RESET}")
             done = (f"{FG_GREEN}Пины возвращены в исходный режим. Готово.{RESET}"
                     if not cfg["dry_run"] else f"{FG_GREEN}Готово.{RESET}")
-            _safe_print(*summary(channels), done)
+            _safe_print(*lines, done)
     sys.exit(exit_code)
 
 if __name__ == "__main__":
