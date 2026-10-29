@@ -8,9 +8,11 @@ GPIO Pulse Generator — TELEOFIS LT70
 
   python3 gpio_pulse_gen.py
 
-Использует нативный sysfs-интерфейс iolines LT70:
-  /dev/pu{N}/direction  — pull-up
-  /dev/pd{N}/direction  — pull-down (наш выход OC)
+Использует sysfs GPIO iolines LT70 (ссылки создаёт /etc/init.d/iolines boot):
+  /dev/pu{N} → /sys/class/gpio/gpio{384+N}  — pull-up
+  /dev/pd{N} → /sys/class/gpio/gpio{393+N}  — pull-down (наш выход OC)
+Линии висят на I2C-расширителе (gpiochip3), запись в value — синхронная и
+небыстрая, поэтому value держим открытым и пишем только его.
 
 Режимы пина (iolines):
   mode1: pu=low, pd=low  → АЦП (пассивный)
@@ -21,9 +23,9 @@ GPIO Pulse Generator — TELEOFIS LT70
   IOx роутера (mode3) → I{x}+ УСПД
   GND роутера         → I{x}- УСПД
 
-Ограничения УСПД RTU202:
-  Частота опроса 2 Гц  (по умолч.) → минимальный импульс 500 мс → max 1 Гц
-  Частота опроса 20 Гц             → минимальный импульс  50 мс → max 10 Гц
+Ограничения УСПД RTU202 (касаются и импульса, и паузы):
+  Частота опроса 2 Гц  (по умолч.) → минимум 500 мс → max 1 Гц при 50 %
+  Частота опроса 20 Гц             → минимум  50 мс → max 10 Гц при 50 %
 """
 
 import sys
@@ -33,13 +35,16 @@ import signal
 import threading
 from datetime import datetime
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ─── ANSI коды ────────────────────────────────────────────────────────────────
 RESET    = "\033[0m"
 BOLD     = "\033[1m"
 DIM      = "\033[2m"
 CLEAR    = "\033[2J\033[H"
+HOME     = "\033[H"
+EOL      = "\033[K"     # стереть до конца строки
+EOS      = "\033[J"     # стереть до конца экрана
 
 FG_WHITE  = "\033[97m"
 FG_CYAN   = "\033[96m"
@@ -54,6 +59,11 @@ BG_GRAY   = "\033[100m"
 BG_WHITE  = "\033[107m"
 BG_RED    = "\033[101m"
 
+# ─── Тайминги ─────────────────────────────────────────────────────────────────
+MIN_LEVEL_FAST = 0.050   # мин. длительность уровня при опросе УСПД 20 Гц, с
+MIN_LEVEL_SLOW = 0.500   # мин. длительность уровня при опросе УСПД 2 Гц, с
+FINISH_MAX     = 2.0     # при остановке дожидаемся конца импульса, если осталось ≤ стольких секунд
+
 # ─── Sysfs GPIO (iolines LT70) ────────────────────────────────────────────────
 
 def io_index(io_num: int) -> int:
@@ -61,47 +71,100 @@ def io_index(io_num: int) -> int:
     return io_num - 1
 
 def pd_path(io_num: int) -> str:
-    return f"/dev/pd{io_index(io_num)}/direction"
+    return f"/dev/pd{io_index(io_num)}"
 
 def pu_path(io_num: int) -> str:
-    return f"/dev/pu{io_index(io_num)}/direction"
+    return f"/dev/pu{io_index(io_num)}"
 
-_warnings = []
-def _warn(msg: str):
-    _warnings.append(msg)
-    if len(_warnings) > 5:
-        _warnings.pop(0)
+class GpioError(Exception):
+    pass
 
-def _write(path: str, val: str):
-    try:
-        with open(path, 'w') as f:
-            f.write(val)
-    except OSError as e:
-        _warn(f"{path}: {e}")
+def _read(path: str) -> str:
+    with open(path) as f:
+        return f.read().strip()
 
-def io_init_oc(io_num: int, dry_run: bool):
-    """mode3: pu=low, pd=high — выход открытый коллектор"""
-    if dry_run:
-        return
-    _write(pu_path(io_num), "low")
-    _write(pd_path(io_num), "high")
+class Line:
+    """Одна sysfs-линия GPIO (/dev/puN или /dev/pdN). Уровни — физические."""
+    def __init__(self, path: str):
+        self.path   = path
+        self.invert = False
+        self.orig   = None
+        self._fd    = None
 
-def io_set(io_num: int, value: bool, dry_run: bool):
-    """
-    Управляем только pd:
-      True  → pd=high → линия притянута к GND → УСПД видит замкнутый контакт
-      False → pd=low  → линия свободна         → УСПД видит разомкнутый контакт
-    """
-    if dry_run:
-        return
-    _write(pd_path(io_num), "high" if value else "low")
+    def open(self):
+        try:
+            if _read(f"{self.path}/direction") != "out":
+                # "low" переводит линию в выход с низким уровнем (так же делает iolines)
+                with open(f"{self.path}/direction", "w") as f:
+                    f.write("low")
+            self.invert = _read(f"{self.path}/active_low") == "1"
+            self.orig   = (_read(f"{self.path}/value") == "1") != self.invert
+            self._fd    = os.open(f"{self.path}/value", os.O_WRONLY)
+        except OSError as e:
+            raise GpioError(f"{self.path}: {e.strerror or e}") from e
 
-def io_reset(io_num: int, dry_run: bool):
-    """Сбрасываем в mode1 (пассивный) при выходе"""
-    if dry_run:
-        return
-    _write(pu_path(io_num), "low")
-    _write(pd_path(io_num), "low")
+    def set(self, level: bool):
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            os.write(self._fd, b"1" if level != self.invert else b"0")
+        except OSError as e:
+            raise GpioError(f"{self.path}/value: {e.strerror or e}") from e
+
+    def close(self):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+class Pin:
+    """Пара линий pu/pd одного IO. В симуляции ничего не пишет."""
+    def __init__(self, io_num: int, dry_run: bool):
+        self.io_num  = io_num
+        self.dry_run = dry_run
+        self.pu      = Line(pu_path(io_num))
+        self.pd      = Line(pd_path(io_num))
+        self._opened = False
+
+    def open(self):
+        """Запоминаем исходное состояние и переводим в mode3 с отпущенной линией."""
+        if self.dry_run:
+            return
+        self.pu.open()
+        self.pd.open()
+        self._opened = True
+        # pd отпускаем первым, чтобы ни на миг не получить pu=high + pd=high
+        self.pd.set(False)
+        self.pu.set(False)
+
+    def set(self, value: bool):
+        """
+        Управляем только pd:
+          True  → pd=high → линия притянута к GND → УСПД видит замкнутый контакт
+          False → pd=low  → линия свободна         → УСПД видит разомкнутый контакт
+        """
+        if self._opened:
+            self.pd.set(value)
+
+    def release(self):
+        """Возвращаем режим, который был до запуска (обычно mode1). Идемпотентно."""
+        if not self._opened:
+            return
+        self._opened = False
+        try:
+            self.pd.set(False)
+            self.pu.set(self.pu.orig)
+            self.pd.set(self.pd.orig)
+        finally:
+            self.pu.close()
+            self.pd.close()
+
+    def orig_mode(self) -> str:
+        if self.dry_run or self.pu.orig is None:
+            return "—"
+        return {(False, False): "mode1", (True, False): "mode2",
+                (False, True): "mode3"}.get((self.pu.orig, self.pd.orig), "pu+pd")
 
 # ─── Канал ────────────────────────────────────────────────────────────────────
 class Channel:
@@ -111,13 +174,14 @@ class Channel:
         self.io_num       = io_num
         self.freq         = freq
         self.duty         = duty
-        self.dry_run      = dry_run
+        self.pin          = Pin(io_num, dry_run)
         self.lpp          = lpp            # литров на импульс
         self.start_liters = start_liters   # начальные показания счётчика, литры
 
         self.count   = 0
         self.state   = False
-        self.running = False
+        self.error   = None                # текст ошибки GPIO, если поток упал
+        self.note    = None                # что случилось с последним импульсом при остановке
         self._thread = None
         self._stop   = threading.Event()
         self.history = [False] * 32
@@ -149,49 +213,102 @@ class Channel:
         """Текущий расход, л/мин (freq имп/с × лит/имп × 60)"""
         return self.freq * self.lpp * 60.0
 
-    def _run(self):
-        self.running = True
-        io_init_oc(self.io_num, self.dry_run)
+    def _set(self, value: bool):
+        self.pin.set(value)
+        self.state = value
+        # новый список вместо мутации — draw() читает history из другого потока
+        self.history = self.history[1:] + [value]
 
-        while not self._stop.is_set():
-            # ON
-            self.state = True
-            self.history.append(True)
-            self.history.pop(0)
-            io_set(self.io_num, True, self.dry_run)
-            self._stop.wait(timeout=self.t_on)
-            if self._stop.is_set():
-                break
+    def _wait_until(self, deadline: float) -> bool:
+        """Ждёт до deadline (monotonic). True — пришёл запрос остановки."""
+        return self._stop.wait(timeout=max(0.0, deadline - time.monotonic()))
 
-            # OFF
-            self.state = False
+    def _finish_pulse(self, on_start: float, on_end: float):
+        """
+        Остановка пришла посреди импульса. Короткий остаток дожидаемся, чтобы
+        счёт скрипта совпал с УСПД; длинный обрываем и засчитываем, только если
+        импульс уже длился ≥ 500 мс (его гарантированно увидел УСПД).
+        """
+        remaining = on_end - time.monotonic()
+        if remaining <= FINISH_MAX:
+            time.sleep(max(0.0, remaining))
+            self._set(False)
             self.count += 1
-            self.history.append(False)
-            self.history.pop(0)
-            io_set(self.io_num, False, self.dry_run)
-            self._stop.wait(timeout=self.t_off)
+            return
+        held = time.monotonic() - on_start
+        self._set(False)
+        if held >= MIN_LEVEL_SLOW:
+            self.count += 1
+            self.note = f"последний импульс прерван через {held*1000:.0f} мс — засчитан"
+        else:
+            self.note = f"последний импульс прерван через {held*1000:.0f} мс — не засчитан"
 
-        self.running = False
-        self.state = False
-        io_reset(self.io_num, self.dry_run)
+    def _run(self):
+        try:
+            t = time.monotonic()
+            while not self._stop.is_set():
+                # ON
+                self._set(True)
+                if self._wait_until(t + self.t_on):
+                    self._finish_pulse(t, t + self.t_on)
+                    break
+                # OFF
+                self._set(False)
+                self.count += 1
+                # шаг по абсолютному времени — задержки записи в I2C не копятся
+                t += self.period
+                if time.monotonic() - t > self.period:
+                    # сильно отстали (подвис I2C) — не догоняем пачкой коротких импульсов
+                    t = time.monotonic()
+                self._wait_until(t)
+        except GpioError as e:
+            self.error = str(e)
+        finally:
+            self.state = False
+            try:
+                self.pin.release()
+            except GpioError as e:
+                self.error = self.error or str(e)
 
     def start(self, phase_delay: float = 0.0):
         def _delayed():
             if phase_delay > 0:
                 self._stop.wait(timeout=phase_delay)
             if self._stop.is_set():
+                self._release_quietly()
                 return
             self._run()
         self._stop.clear()
         self._thread = threading.Thread(target=_delayed, daemon=True)
         self._thread.start()
 
+    def _release_quietly(self):
+        try:
+            self.pin.release()
+        except GpioError as e:
+            self.error = self.error or str(e)
+
     def stop(self):
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=FINISH_MAX + 3)
+        else:
+            self._release_quietly()
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
+def box(title: str, width: int) -> list:
+    """Рамка с заголовком; width — внутренняя ширина."""
+    text = f"  {title}"
+    return [
+        f"{BOLD}{FG_CYAN}╔{'═'*width}╗{RESET}",
+        f"{BOLD}{FG_CYAN}║{text}{' '*(width-len(text))}║{RESET}",
+        f"{BOLD}{FG_CYAN}╚{'═'*width}╝{RESET}",
+    ]
+
+def fmt_l(v: float) -> str:
+    """Литры без хвостовых нулей: 51 → '51', 12.5 → '12.5'"""
+    return f"{v:.3f}".rstrip("0").rstrip(".")
+
 def sparkline(history: list) -> str:
     out = []
     for v in history:
@@ -227,8 +344,7 @@ def odometer(ch) -> str:
 
 
 def draw(channels: list, dry_run: bool, start_time: float):
-    now = time.time()
-    elapsed = now - start_time
+    elapsed = time.monotonic() - start_time
     hh = int(elapsed // 3600)
     mm = int((elapsed % 3600) // 60)
     ss = int(elapsed % 60)
@@ -236,10 +352,7 @@ def draw(channels: list, dry_run: bool, start_time: float):
 
     W = 60
 
-    out = [CLEAR]
-    out.append(f"{BOLD}{FG_CYAN}╔{'═'*W}╗{RESET}")
-    out.append(f"{BOLD}{FG_CYAN}║  GPIO Pulse Generator — TELEOFIS LT70{' '*(W-38)}║{RESET}")
-    out.append(f"{BOLD}{FG_CYAN}╚{'═'*W}╝{RESET}")
+    out = box("GPIO Pulse Generator — TELEOFIS LT70", W)
 
     mode = f"{FG_YELLOW}СИМУЛЯЦИЯ{RESET}" if dry_run else f"{FG_GREEN}РЕАЛЬНЫЙ GPIO{RESET}"
     out.append(f"  Режим: {mode}   {FG_GRAY}{ts}   uptime {hh:02d}:{mm:02d}:{ss:02d}{RESET}")
@@ -250,7 +363,7 @@ def draw(channels: list, dry_run: bool, start_time: float):
         out.append(
             f"  {BOLD}{FG_CYAN}Выход {ch.idx}{RESET}  "
             f"IO{ch.io_num}  "
-            f"{FG_GRAY}/dev/pd{idx}/direction{RESET}"
+            f"{FG_GRAY}/dev/pd{idx}/value   (до запуска: {ch.pin.orig_mode()}){RESET}"
         )
         out.append(
             f"  {FG_GRAY}freq={ch.freq:.3f} Гц   "
@@ -268,14 +381,10 @@ def draw(channels: list, dry_run: bool, start_time: float):
         )
         out.append(
             f"  {FG_GRAY}объём: {RESET}{BOLD}{FG_WHITE}{ch.m3:.3f} м³{RESET}"
-            f"{FG_GRAY}  ({ch.liters:.0f} л)   расход: {RESET}"
+            f"{FG_GRAY}  ({fmt_l(ch.liters)} л)   расход: {RESET}"
             f"{BOLD}{FG_WHITE}{ch.flow_lpm:.2f} л/мин{RESET}"
         )
         out.append(f"  {FG_GRAY}{'─'*32}{RESET}  {sparkline(ch.history)}")
-        out.append("")
-
-    if _warnings:
-        out.append(f"  {FG_YELLOW}⚠  " + "   ".join(_warnings[-2:]) + RESET)
         out.append("")
 
     total   = sum(c.count for c in channels)
@@ -283,36 +392,48 @@ def draw(channels: list, dry_run: bool, start_time: float):
     out.append(f"  {FG_GRAY}{'─'*W}{RESET}")
     out.append(
         f"  {DIM}Всего импульсов: {total}   "
-        f"Всего: {total_l/1000.0:.3f} м³ ({total_l:.0f} л)   "
+        f"Всего: {total_l/1000.0:.3f} м³ ({fmt_l(total_l)} л)   "
         f"Ctrl+C — выход{RESET}"
     )
 
-    print("\n".join(out), end="", flush=True)
+    # без полной очистки экрана — табло не мерцает
+    print(HOME + "".join(line + EOL + "\n" for line in out) + EOS, end="", flush=True)
+
+def summary(channels: list) -> list:
+    """Итог по каналам после остановки — для сверки с показаниями УСПД."""
+    out = []
+    for ch in channels:
+        line = (f"  Выход {ch.idx} (IO{ch.io_num}): {ch.count} имп., "
+                f"{ch.m3:.3f} м³ ({fmt_l(ch.liters)} л)")
+        if ch.note:
+            line += f"  {FG_GRAY}— {ch.note}{RESET}"
+        out.append(line)
+        if ch.error:
+            out.append(f"  {FG_RED}  ошибка GPIO: {ch.error}{RESET}")
+    return out
 
 # ─── Проверки ─────────────────────────────────────────────────────────────────
 def check_freq(freq: float, duty: float):
-    t_on_ms = (1.0 / freq) * duty * 1000
-    if t_on_ms < 50:
-        print(f"\n{FG_YELLOW}⚠  ON = {t_on_ms:.1f} мс < 50 мс — импульсы будут теряться!")
-        print(f"   Минимум для УСПД RTU202 при опросе 20 Гц = 50 мс{RESET}\n")
+    t_on  = (1.0 / freq) * duty
+    t_off = (1.0 / freq) * (1.0 - duty)
+    shortest, what = min((t_on, "ON"), (t_off, "OFF"))
+    ms = shortest * 1000
+    if shortest < MIN_LEVEL_FAST:
+        print(f"\n{FG_YELLOW}⚠  {what} = {ms:.1f} мс < 50 мс — импульсы будут теряться!")
+        print(f"   Минимум для УСПД RTU202 при опросе 20 Гц = 50 мс (и для импульса, и для паузы){RESET}\n")
         time.sleep(3)
-    elif t_on_ms < 500:
-        print(f"\n{FG_YELLOW}⚠  ON = {t_on_ms:.1f} мс < 500 мс")
-        print("   При опросе УСПД 2 Гц (по умолч.) минимум = 500 мс")
-        print(f"   Переключите УСПД на 20 Гц или уменьшите частоту{RESET}\n")
+    elif shortest < MIN_LEVEL_SLOW:
+        print(f"\n{FG_YELLOW}⚠  {what} = {ms:.1f} мс < 500 мс")
+        print("   При опросе УСПД 2 Гц (по умолч.) минимум = 500 мс (и для импульса, и для паузы)")
+        print(f"   Переключите УСПД на 20 Гц, уменьшите частоту или выровняйте скважность{RESET}\n")
         time.sleep(3)
 
-def check_sysfs(io_num: int, dry_run: bool) -> bool:
-    if dry_run:
-        return True
-    for path in [pu_path(io_num), pd_path(io_num)]:
-        if not os.path.exists(path):
-            print(f"{FG_YELLOW}⚠  Не найден: {path}")
-            print("   Установите пакет и инициализируйте:")
-            print("     opkg install iolines-lt70")
-            print(f"     /etc/init.d/iolines boot{RESET}")
-            return False
-    return True
+def gpio_hint() -> list:
+    return [
+        f"{FG_YELLOW}   Проверьте, что скрипт запущен от root и iolines инициализирован:",
+        "     opkg install iolines-lt70",
+        f"     /etc/init.d/iolines boot{RESET}",
+    ]
 
 # ─── Интерактивный ввод ───────────────────────────────────────────────────────
 def _read_line(prompt: str, default_repr: str) -> str:
@@ -348,11 +469,16 @@ def ask_float(label: str, default: float,
 
 def ask_yesno(label: str, default: bool = False) -> bool:
     opts = "[Д/н]" if default else "[д/Н]"
-    raw = _read_line(f"  {FG_CYAN}{label}{RESET} {opts}: ",
-                     "д" if default else "н").lower()
-    if raw == "":
-        return default
-    return raw[0] in ("y", "д", "1", "t", "+")
+    while True:
+        raw = _read_line(f"  {FG_CYAN}{label}{RESET} {opts}: ",
+                         "д" if default else "н").lower()
+        if raw == "":
+            return default
+        if raw[0] in ("y", "д", "1", "t", "+"):
+            return True
+        if raw[0] in ("n", "н", "0", "f", "-"):
+            return False
+        print(f"{FG_YELLOW}   Ответьте «д» или «н»{RESET}")
 
 def ask_outputs(default: str = "1") -> list:
     while True:
@@ -378,9 +504,7 @@ def ask_outputs(default: str = "1") -> list:
 
 def configure() -> dict:
     """Интерактивный мастер настройки. Возвращает словарь параметров."""
-    print(f"{BOLD}{FG_CYAN}╔══════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{FG_CYAN}║  GPIO Pulse Generator — TELEOFIS LT70 → УСПД RTU202   ║{RESET}")
-    print(f"{BOLD}{FG_CYAN}╚══════════════════════════════════════════════════════╝{RESET}")
+    print("\n".join(box("GPIO Pulse Generator — TELEOFIS LT70 → УСПД RTU202", 56)))
     print(f"{FG_GRAY}  Настройка по шагам. Enter — значение по умолчанию. Ctrl+C — выход.{RESET}\n")
 
     dry_run = ask_yesno("Режим симуляции (без записи в GPIO)?", default=False)
@@ -406,6 +530,19 @@ def configure() -> dict:
     }
 
 # ─── main ─────────────────────────────────────────────────────────────────────
+class _Interrupted(Exception):
+    pass
+
+class _GpioInitFailed(Exception):
+    pass
+
+def _safe_print(*lines):
+    """Печать, которая не мешает остановке, если терминал уже отвалился (обрыв SSH)."""
+    try:
+        print("\n".join(lines), flush=True)
+    except (OSError, ValueError):
+        pass
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
         print(f"gpio_pulse_gen {__version__}")
@@ -417,56 +554,69 @@ def main():
         print(f"\n{FG_YELLOW}Отменено.{RESET}")
         return
 
-    io_pins = cfg["io_pins"]
-
-    # Каналы создаём заранее — до возможной блокирующей паузы в check_freq,
-    # чтобы обработчики сигналов уже могли корректно их остановить.
     channels = [
         Channel(i + 1, pin, cfg["freq"], cfg["duty"], cfg["dry_run"],
                 cfg["lpp"], cfg["start_liters"][i])
-        for i, pin in enumerate(io_pins)
+        for i, pin in enumerate(cfg["io_pins"])
     ]
 
-    _shutting_down = threading.Event()
+    # SIGHUP — обрыв SSH: без обработчика процесс умер бы, оставив пин замкнутым
+    stop_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        stop_signals.append(signal.SIGHUP)
 
-    def shutdown(sig=None, frame=None):
-        # Идемпотентно: при Ctrl+C обработчик и finally не должны дублироваться.
-        if _shutting_down.is_set():
-            return
-        _shutting_down.set()
-        print("\033[?25h", end="", flush=True)
-        print(f"\n{FG_YELLOW}Остановка...{RESET}", flush=True)
-        for ch in channels:
-            ch.stop()
-        print(f"{FG_GREEN}Пины сброшены в mode1. Готово.{RESET}")
-        sys.exit(0)
+    def on_signal(sig, frame):
+        raise _Interrupted()
 
-    signal.signal(signal.SIGINT,  shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    for s in stop_signals:
+        signal.signal(s, on_signal)
 
-    check_freq(cfg["freq"], cfg["duty"])
-
-    for io_num in io_pins:
-        if not check_sysfs(io_num, cfg["dry_run"]):
-            sys.exit(1)
-
-    # равномерный сдвиг фазы между выходами: при N каналах i-й сдвинут на i/N периода
-    period = channels[0].period
-    n = len(channels)
-    start_time = time.time()
-    for i, ch in enumerate(channels):
-        delay = 0.0 if cfg["sync"] else (period / n * i)
-        ch.start(phase_delay=delay)
-
-    print("\033[?25l", end="", flush=True)
-
+    exit_code = 0
+    started = False
     try:
-        while True:
+        check_freq(cfg["freq"], cfg["duty"])
+
+        for ch in channels:
+            try:
+                ch.pin.open()
+            except GpioError as e:
+                _safe_print(f"{FG_YELLOW}⚠  IO{ch.io_num}: {e}{RESET}", *gpio_hint())
+                raise _GpioInitFailed()
+
+        # равномерный сдвиг фазы между выходами: при N каналах i-й сдвинут на i/N периода
+        period = channels[0].period
+        n = len(channels)
+        print(CLEAR + "\033[?25l", end="", flush=True)
+        start_time = time.monotonic()
+        started = True
+        for i, ch in enumerate(channels):
+            delay = 0.0 if cfg["sync"] else (period / n * i)
+            ch.start(phase_delay=delay)
+
+        while not any(ch.error for ch in channels):
             draw(channels, cfg["dry_run"], start_time)
             time.sleep(cfg["refresh"])
+        exit_code = 1
+    except _Interrupted:
+        pass
+    except _GpioInitFailed:
+        exit_code = 1
+    except OSError:
+        # терминал недоступен (обрыв SSH) — просто останавливаемся
+        pass
     finally:
-        print("\033[?25h", end="", flush=True)
-        shutdown()
+        # повторный Ctrl+C/обрыв связи не должен прервать сброс пинов
+        for s in stop_signals:
+            signal.signal(s, signal.SIG_IGN)
+        if started:
+            _safe_print("\033[?25h", f"\n{FG_YELLOW}Остановка...{RESET}")
+        for ch in channels:
+            ch.stop()
+        if started:
+            done = (f"{FG_GREEN}Пины возвращены в исходный режим. Готово.{RESET}"
+                    if not cfg["dry_run"] else f"{FG_GREEN}Готово.{RESET}")
+            _safe_print(*summary(channels), done)
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
